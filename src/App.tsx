@@ -11,8 +11,9 @@ import { CallHistory } from './components/CallHistory';
 import { QRCodeModal } from './components/QRCodeModal';
 import { CallState, CallStats, ChatMessage, PeerInfo, CallLog } from './types/calling';
 import { WebRTCService } from './services/webrtcService';
+import { AudioBridge } from './utils/audioBridge';
 import { soundEffects } from './utils/soundEffects';
-import { AlertCircle, PhoneCall, ShieldCheck, Activity, RefreshCw } from 'lucide-react';
+import { AlertCircle, PhoneCall, ShieldCheck, Activity, Check, Mic, Video, Radio } from 'lucide-react';
 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<'line' | 'chamber' | 'history'>('line');
@@ -29,7 +30,12 @@ export default function App() {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
 
-  // Connection Log Steps for transparency
+  // System Diagnostics Check
+  const [micStatus, setMicStatus] = useState<'checking' | 'ok' | 'denied'>('checking');
+  const [camStatus, setCamStatus] = useState<'checking' | 'ok' | 'denied'>('checking');
+  const [serverStatus, setServerStatus] = useState<'connecting' | 'online' | 'offline'>('connecting');
+
+  // Connection Log Steps
   const [connectionLogs, setConnectionLogs] = useState<string[]>([]);
 
   // In-Call Media States
@@ -61,10 +67,11 @@ export default function App() {
   const [lastCallLog, setLastCallLog] = useState<CallLog | null>(null);
   const callStartTimeRef = useRef<number>(0);
 
-  // Signaling References
+  // Signaling & Audio Bridge References
   const wsRef = useRef<WebSocket | null>(null);
   const pollIntervalRef = useRef<any>(null);
   const webrtcRef = useRef<WebRTCService | null>(null);
+  const audioBridgeRef = useRef<AudioBridge | null>(null);
   const myPeerIdRef = useRef<string>('');
   const activeRoomIdRef = useRef<string>('');
 
@@ -72,14 +79,57 @@ export default function App() {
     setConnectionLogs((prev) => [...prev.slice(-4), `${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}: ${msg}`]);
   };
 
-  // 1. Detect direct link parameter (`?line=123456`)
+  // Run initial diagnostic check for mic, camera, and server
   useEffect(() => {
+    // Check server status
+    fetch('/api/status')
+      .then((res) => res.json())
+      .then(() => setServerStatus('online'))
+      .catch(() => setServerStatus('offline'));
+
+    // Check media permissions
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      navigator.mediaDevices
+        .getUserMedia({ audio: true, video: true })
+        .then((s) => {
+          setMicStatus('ok');
+          setCamStatus('ok');
+          setLocalStream(s);
+        })
+        .catch((e) => {
+          if (e.name === 'NotAllowedError') {
+            setMicStatus('denied');
+            setCamStatus('denied');
+          } else {
+            // Try audio only
+            navigator.mediaDevices
+              .getUserMedia({ audio: true })
+              .then((s) => {
+                setMicStatus('ok');
+                setLocalStream(s);
+              })
+              .catch(() => setMicStatus('denied'));
+          }
+        });
+    }
+
+    // Check URL parameters for invitation (`?line=123456`)
     const params = new URLSearchParams(window.location.search);
     const lineParam = params.get('line') || params.get('code');
     if (lineParam) {
       setActiveLineId(lineParam);
       setInvitedLineId(lineParam);
     }
+  }, []);
+
+  // Initialize Fallback Audio Bridge
+  useEffect(() => {
+    audioBridgeRef.current = new AudioBridge((base64Chunk) => {
+      sendSignaling({
+        type: 'media-chunk',
+        chunk: base64Chunk,
+      });
+    });
   }, []);
 
   // Save history & name
@@ -98,7 +148,7 @@ export default function App() {
   // Connect Signaling
   const connectSignaling = (roomId: string, displayName: string) => {
     activeRoomIdRef.current = roomId;
-    logStep(`Connecting signaling server for line: ${roomId}...`);
+    logStep(`Connecting line: ${roomId}...`);
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -107,7 +157,8 @@ export default function App() {
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        logStep('WebSocket connected');
+        logStep('WebSocket signaling active');
+        setServerStatus('online');
         ws.send(JSON.stringify({ type: 'join-room', roomId, displayName }));
       };
 
@@ -143,7 +194,7 @@ export default function App() {
         }
 
         if (data.otherPeer) {
-          logStep(`Partner detected on line: ${data.otherPeer.displayName}`);
+          logStep(`Partner online: ${data.otherPeer.displayName}`);
           setPartnerInfo({ id: data.otherPeer.id, displayName: data.otherPeer.displayName });
         }
       })
@@ -180,14 +231,14 @@ export default function App() {
     }).catch((e) => {});
   };
 
-  // WebRTC Signal Handler
+  // WebRTC & Audio Bridge Signal Handler
   const handleSignalingMessage = async (msg: any) => {
     if (msg.senderId && msg.senderId === myPeerIdRef.current) return;
 
     switch (msg.type) {
       case 'room-joined': {
         myPeerIdRef.current = msg.peerId;
-        logStep('Joined call line successfully');
+        logStep('Line connected. Ready for partner.');
         if (msg.otherPeer) {
           setPartnerInfo({ id: msg.otherPeer.id, displayName: msg.otherPeer.displayName });
         }
@@ -197,7 +248,7 @@ export default function App() {
       case 'room-full': {
         soundEffects.stopRinging();
         setCallState('idle');
-        setErrorMessage(msg.message || 'This direct call line is full (2 persons max).');
+        setErrorMessage(msg.message || 'This line is full (maximum 2 participants allowed).');
         setTimeout(() => setErrorMessage(null), 5000);
         break;
       }
@@ -208,18 +259,16 @@ export default function App() {
 
         if (webrtcRef.current) {
           try {
-            logStep('Creating WebRTC Offer...');
+            logStep('Connecting HD Peer Stream...');
             const offer = await webrtcRef.current.createOffer();
             sendSignaling({ type: 'offer', offer });
-          } catch (e) {
-            console.error('Error creating offer:', e);
-          }
+          } catch (e) {}
         }
         break;
       }
 
       case 'peer-left': {
-        logStep('Partner disconnected');
+        logStep('Partner left line');
         if (callState === 'connected' || callState === 'dialing') {
           handleEndCall();
         }
@@ -227,7 +276,7 @@ export default function App() {
       }
 
       case 'offer': {
-        logStep('Received WebRTC Offer from partner');
+        logStep('Received Stream Offer...');
         const service = initWebRTCService();
 
         if (localStream) {
@@ -235,7 +284,6 @@ export default function App() {
         }
 
         const answer = await service.handleOffer(msg.offer);
-        logStep('Sending WebRTC Answer...');
         sendSignaling({ type: 'answer', answer });
 
         setPartnerInfo({
@@ -252,7 +300,7 @@ export default function App() {
       }
 
       case 'answer': {
-        logStep('WebRTC Answer received from partner');
+        logStep('Stream Answered. Call Connected!');
         if (webrtcRef.current) {
           await webrtcRef.current.handleAnswer(msg.answer);
           if (callState !== 'connected') {
@@ -272,7 +320,7 @@ export default function App() {
       }
 
       case 'call-accept': {
-        logStep('Partner accepted call invitation');
+        logStep('Partner accepted call.');
         if (webrtcRef.current && callState === 'dialing') {
           const offer = await webrtcRef.current.createOffer();
           sendSignaling({ type: 'offer', offer });
@@ -304,6 +352,14 @@ export default function App() {
         break;
       }
 
+      // Live Fallback Voice Stream Packet
+      case 'media-chunk': {
+        if (msg.chunk && audioBridgeRef.current) {
+          audioBridgeRef.current.playIncomingAudioChunk(msg.chunk);
+        }
+        break;
+      }
+
       default:
         break;
     }
@@ -314,7 +370,7 @@ export default function App() {
 
     const instance = new WebRTCService({
       onRemoteStream: (stream) => {
-        logStep('Remote Audio/Video Stream active!');
+        logStep('HD Audio/Video Active!');
         setRemoteStream(stream);
       },
       onRemoteStreamEnded: () => {
@@ -333,7 +389,7 @@ export default function App() {
         sendSignaling(signal);
       },
       onConnectionStateChange: (state) => {
-        logStep(`Connection state: ${state}`);
+        logStep(`P2P Status: ${state}`);
         if (state === 'connected') {
           setCallState('connected');
           callStartTimeRef.current = Date.now();
@@ -360,20 +416,22 @@ export default function App() {
     setActiveLineId(lineId);
     setMyDisplayName(name);
     setConnectionLogs([]);
-    logStep(`Initializing media devices...`);
+    logStep('Initializing camera & microphone...');
 
     let stream = localStream;
     if (!stream) {
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         setLocalStream(stream);
-        logStep('Microphone & Camera ready');
+        setMicStatus('ok');
+        setCamStatus('ok');
+        logStep('Camera & Mic granted');
       } catch (err: any) {
         console.error('Failed media capture:', err);
         setErrorMessage(
           err.name === 'NotAllowedError'
-            ? 'Camera/Mic permission denied. Please allow camera and mic access in your browser settings.'
-            : 'Could not access camera/mic. Please check device connection.'
+            ? 'Camera/Mic permission denied. Please click the lock icon in your browser address bar and allow Camera and Microphone.'
+            : 'Could not access camera/mic. Please check your device settings.'
         );
         return;
       }
@@ -381,6 +439,11 @@ export default function App() {
 
     const service = initWebRTCService();
     service.setLocalStream(stream);
+
+    // Start Fallback Audio Bridge
+    if (audioBridgeRef.current && stream) {
+      audioBridgeRef.current.startCapture(stream);
+    }
 
     connectSignaling(lineId, name);
 
@@ -401,6 +464,10 @@ export default function App() {
   const handleEndCall = () => {
     soundEffects.playCallEnded();
     sendSignaling({ type: 'call-hangup' });
+
+    if (audioBridgeRef.current) {
+      audioBridgeRef.current.stopCapture();
+    }
 
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current);
@@ -502,6 +569,24 @@ export default function App() {
         }}
       />
 
+      {/* Real-time System Readiness Bar */}
+      <div className="bg-slate-900 border-b border-slate-800/80 px-4 py-2 text-xs font-mono flex flex-wrap items-center justify-center gap-4 text-slate-400">
+        <div className="flex items-center gap-1.5">
+          <Mic className={`w-3.5 h-3.5 ${micStatus === 'ok' ? 'text-emerald-400' : 'text-amber-400'}`} />
+          <span>Microphone: {micStatus === 'ok' ? 'Ready' : 'Check Permission'}</span>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <Video className={`w-3.5 h-3.5 ${camStatus === 'ok' ? 'text-emerald-400' : 'text-amber-400'}`} />
+          <span>Camera: {camStatus === 'ok' ? 'Ready' : 'Check Permission'}</span>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <Radio className={`w-3.5 h-3.5 ${serverStatus === 'online' ? 'text-emerald-400' : 'text-red-400'}`} />
+          <span>DuoCall Server: {serverStatus === 'online' ? 'Connected' : 'Connecting...'}</span>
+        </div>
+      </div>
+
       {/* Global Toast Error Banner */}
       {errorMessage && (
         <div className="bg-red-950/90 border-b border-red-800 text-red-200 px-4 py-3 text-xs font-semibold flex items-center justify-center gap-2 animate-fadeIn">
@@ -544,11 +629,11 @@ export default function App() {
             }}
           />
 
-          {/* Real-Time Connection Diagnostic Console */}
+          {/* Connection Console */}
           <div className="fixed bottom-6 left-6 z-50 max-w-sm bg-slate-900/95 border border-slate-800 rounded-xl p-3 text-[11px] font-mono shadow-2xl space-y-1">
             <div className="text-slate-400 font-bold flex items-center gap-1.5 mb-1">
               <Activity className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Live Connection Diagnostics</span>
+              <span>Live Connection Status</span>
             </div>
             {connectionLogs.map((log, idx) => (
               <div key={idx} className="text-slate-300 truncate">
@@ -708,7 +793,7 @@ export default function App() {
         <div className="flex items-center gap-4 text-slate-500">
           <span>Max 2 Participants per Line</span>
           <span>·</span>
-          <span>WebRTC P2P + HTTP Polling Backup</span>
+          <span>WebRTC P2P + Live Audio Bridge</span>
         </div>
       </footer>
     </div>
