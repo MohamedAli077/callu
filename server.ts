@@ -31,12 +31,11 @@ interface Room {
   createdAt: number;
 }
 
-// In-memory rooms and pending signal queues for HTTP fallback
 const rooms = new Map<string, Room>();
-const signalQueues = new Map<string, any[]>(); // peerId -> array of signals
+const signalQueues = new Map<string, any[]>();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
@@ -46,7 +45,6 @@ setInterval(() => {
   const now = Date.now();
   rooms.forEach((room, roomId) => {
     room.peers.forEach((peer, peerId) => {
-      // If inactive for > 45s and no active WS, purge peer
       const ws = room.wsPeers.get(peerId);
       if (now - peer.lastActive > 45000 && (!ws || ws.readyState !== WebSocket.OPEN)) {
         room.peers.delete(peerId);
@@ -61,11 +59,9 @@ setInterval(() => {
   });
 }, 30000);
 
-// Helper to push signal to a specific peer (via WS or HTTP queue)
 function deliverSignal(targetPeerId: string, signal: any) {
   let delivered = false;
 
-  // Try WS first
   rooms.forEach((room) => {
     const ws = room.wsPeers.get(targetPeerId);
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -74,15 +70,13 @@ function deliverSignal(targetPeerId: string, signal: any) {
     }
   });
 
-  // Always queue for HTTP polling safety net
   let queue = signalQueues.get(targetPeerId);
   if (!queue) {
     queue = [];
     signalQueues.set(targetPeerId, queue);
   }
   queue.push(signal);
-  // Keep queue bounded
-  if (queue.length > 50) queue.shift();
+  if (queue.length > 100) queue.shift();
 
   return delivered;
 }
@@ -98,7 +92,7 @@ function broadcastToRoom(roomId: string, senderId: string, signal: any) {
   });
 }
 
-// WS Heartbeat Ping
+// Heartbeat ping
 setInterval(() => {
   wss.clients.forEach((ws) => {
     const peer = ws as PeerSocket;
@@ -139,7 +133,6 @@ wss.on('connection', (ws: WebSocket) => {
             rooms.set(roomId, room);
           }
 
-          // STRICT ENFORCEMENT: Max 2 active peers per room!
           if (room.peers.size >= 2 && !room.peers.has(peer.id)) {
             peer.send(
               JSON.stringify({
@@ -161,7 +154,6 @@ wss.on('connection', (ws: WebSocket) => {
 
           const existingPeers = Array.from(room.peers.values()).filter((p) => p.id !== peer.id);
 
-          // Reply to joining peer
           peer.send(
             JSON.stringify({
               type: 'room-joined',
@@ -172,12 +164,11 @@ wss.on('connection', (ws: WebSocket) => {
             })
           );
 
-          // Notify existing peer
           if (existingPeers.length > 0) {
             broadcastToRoom(roomId, peer.id, {
               type: 'peer-joined',
               peerId: peer.id,
-              displayName: peer.displayName,
+              displayName: peer.displayName || 'Peer',
               peersCount: room.peers.size,
             });
           }
@@ -192,7 +183,8 @@ wss.on('connection', (ws: WebSocket) => {
         case 'call-decline':
         case 'call-hangup':
         case 'media-state':
-        case 'chat-message': {
+        case 'chat-message':
+        case 'media-chunk': {
           if (peer.roomId) {
             broadcastToRoom(peer.roomId, peer.id, {
               ...msg,
@@ -227,7 +219,7 @@ wss.on('connection', (ws: WebSocket) => {
   });
 });
 
-// HTTP REST Signaling Fallback APIs
+// REST Fallback APIs
 app.post('/api/signaling/join', (req, res) => {
   const { roomId, displayName, peerId: existingPeerId } = req.body;
   if (!roomId) return res.status(400).json({ error: 'Missing roomId' });
@@ -290,7 +282,6 @@ app.get('/api/signaling/poll', (req, res) => {
   const { roomId, peerId } = req.query as { roomId: string; peerId: string };
   if (!peerId) return res.status(400).json({ error: 'Missing peerId' });
 
-  // Refresh active timestamp
   if (roomId) {
     const room = rooms.get(roomId);
     if (room && room.peers.has(peerId)) {
