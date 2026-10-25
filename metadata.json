@@ -1,0 +1,6 @@
+{
+  "name": "DuoCall - Private 1-on-1 Direct Calling",
+  "description": "Secure, direct peer-to-peer 1-on-1 HD voice and video calling app designed strictly for two people.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
