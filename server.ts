@@ -18,13 +18,22 @@ interface PeerSocket extends WebSocket {
   isAlive?: boolean;
 }
 
+interface RoomPeer {
+  id: string;
+  displayName: string;
+  lastActive: number;
+}
+
 interface Room {
   id: string;
-  peers: Map<string, PeerSocket>;
+  peers: Map<string, RoomPeer>;
+  wsPeers: Map<string, PeerSocket>;
   createdAt: number;
 }
 
+// In-memory rooms and pending signal queues for HTTP fallback
 const rooms = new Map<string, Room>();
+const signalQueues = new Map<string, any[]>(); // peerId -> array of signals
 
 const app = express();
 app.use(express.json());
@@ -32,56 +41,72 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-// Clean up stale heartbeats every 30 seconds
-const interval = setInterval(() => {
-  wss.clients.forEach((ws: WebSocket) => {
-    const peer = ws as PeerSocket;
-    if (peer.isAlive === false) {
-      return peer.terminate();
-    }
-    peer.isAlive = false;
-    peer.ping();
-  });
-}, 30000);
-
-wss.on('close', () => {
-  clearInterval(interval);
-});
-
-function broadcastToRoom(roomId: string, senderId: string, payload: any) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  const messageString = JSON.stringify(payload);
-  room.peers.forEach((peer, peerId) => {
-    if (peerId !== senderId && peer.readyState === WebSocket.OPEN) {
-      peer.send(messageString);
-    }
-  });
-}
-
-function leaveRoom(peer: PeerSocket) {
-  if (!peer.roomId) return;
-  const roomId = peer.roomId;
-  const room = rooms.get(roomId);
-
-  if (room) {
-    room.peers.delete(peer.id);
-    
-    // Notify remaining peer
-    broadcastToRoom(roomId, peer.id, {
-      type: 'peer-left',
-      peerId: peer.id,
-      displayName: peer.displayName || 'Partner',
-      peersCount: room.peers.size,
+// Cleanup inactive rooms every 30 seconds
+setInterval(() => {
+  const now = Date.now();
+  rooms.forEach((room, roomId) => {
+    room.peers.forEach((peer, peerId) => {
+      // If inactive for > 45s and no active WS, purge peer
+      const ws = room.wsPeers.get(peerId);
+      if (now - peer.lastActive > 45000 && (!ws || ws.readyState !== WebSocket.OPEN)) {
+        room.peers.delete(peerId);
+        room.wsPeers.delete(peerId);
+        signalQueues.delete(peerId);
+      }
     });
 
     if (room.peers.size === 0) {
       rooms.delete(roomId);
     }
-  }
+  });
+}, 30000);
 
-  peer.roomId = undefined;
+// Helper to push signal to a specific peer (via WS or HTTP queue)
+function deliverSignal(targetPeerId: string, signal: any) {
+  let delivered = false;
+
+  // Try WS first
+  rooms.forEach((room) => {
+    const ws = room.wsPeers.get(targetPeerId);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(signal));
+      delivered = true;
+    }
+  });
+
+  // Always queue for HTTP polling safety net
+  let queue = signalQueues.get(targetPeerId);
+  if (!queue) {
+    queue = [];
+    signalQueues.set(targetPeerId, queue);
+  }
+  queue.push(signal);
+  // Keep queue bounded
+  if (queue.length > 50) queue.shift();
+
+  return delivered;
 }
+
+function broadcastToRoom(roomId: string, senderId: string, signal: any) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  room.peers.forEach((_, peerId) => {
+    if (peerId !== senderId) {
+      deliverSignal(peerId, signal);
+    }
+  });
+}
+
+// WS Heartbeat Ping
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    const peer = ws as PeerSocket;
+    if (peer.isAlive === false) return peer.terminate();
+    peer.isAlive = false;
+    peer.ping();
+  });
+}, 25000);
 
 wss.on('connection', (ws: WebSocket) => {
   const peer = ws as PeerSocket;
@@ -103,41 +128,40 @@ wss.on('connection', (ws: WebSocket) => {
 
           peer.displayName = displayName || 'Peer';
 
-          // If peer was in another room, leave it
-          if (peer.roomId) {
-            leaveRoom(peer);
-          }
-
           let room = rooms.get(roomId);
           if (!room) {
             room = {
               id: roomId,
               peers: new Map(),
+              wsPeers: new Map(),
               createdAt: Date.now(),
             };
             rooms.set(roomId, room);
           }
 
-          // STRICT ENFORCEMENT: Max 2 users per call line!
+          // STRICT ENFORCEMENT: Max 2 active peers per room!
           if (room.peers.size >= 2 && !room.peers.has(peer.id)) {
             peer.send(
               JSON.stringify({
                 type: 'room-full',
                 roomId,
-                message: 'This direct call line is full (maximum 2 participants allowed).',
+                message: 'This 1-on-1 direct line is full (maximum 2 participants allowed).',
               })
             );
             return;
           }
 
-          room.peers.set(peer.id, peer);
           peer.roomId = roomId;
+          room.peers.set(peer.id, {
+            id: peer.id,
+            displayName: peer.displayName || 'Peer',
+            lastActive: Date.now(),
+          });
+          room.wsPeers.set(peer.id, peer);
 
-          const existingPeers = Array.from(room.peers.values())
-            .filter((p) => p.id !== peer.id)
-            .map((p) => ({ id: p.id, displayName: p.displayName }));
+          const existingPeers = Array.from(room.peers.values()).filter((p) => p.id !== peer.id);
 
-          // Send confirmation to the joining peer
+          // Reply to joining peer
           peer.send(
             JSON.stringify({
               type: 'room-joined',
@@ -148,7 +172,7 @@ wss.on('connection', (ws: WebSocket) => {
             })
           );
 
-          // Notify other peer in the room
+          // Notify existing peer
           if (existingPeers.length > 0) {
             broadcastToRoom(roomId, peer.id, {
               type: 'peer-joined',
@@ -160,13 +184,6 @@ wss.on('connection', (ws: WebSocket) => {
           break;
         }
 
-        case 'leave-room': {
-          leaveRoom(peer);
-          peer.send(JSON.stringify({ type: 'room-left' }));
-          break;
-        }
-
-        // WebRTC Signaling Forwarding (offer, answer, ice-candidate, ring, decline, etc.)
         case 'offer':
         case 'answer':
         case 'ice-candidate':
@@ -190,26 +207,103 @@ wss.on('connection', (ws: WebSocket) => {
           break;
       }
     } catch (err) {
-      console.error('Error handling WS message:', err);
+      console.error('WS Error handling message:', err);
     }
   });
 
   peer.on('close', () => {
-    leaveRoom(peer);
-  });
-
-  peer.on('error', (err) => {
-    console.error('WS Peer error:', err);
+    if (peer.roomId) {
+      const room = rooms.get(peer.roomId);
+      if (room) {
+        room.wsPeers.delete(peer.id);
+        broadcastToRoom(peer.roomId, peer.id, {
+          type: 'peer-left',
+          peerId: peer.id,
+          displayName: peer.displayName || 'Partner',
+          peersCount: room.peers.size - 1,
+        });
+      }
+    }
   });
 });
 
-// API Routes
-app.get('/api/status', (req, res) => {
-  res.json({
-    status: 'online',
-    activeRooms: rooms.size,
-    timestamp: new Date().toISOString(),
+// HTTP REST Signaling Fallback APIs
+app.post('/api/signaling/join', (req, res) => {
+  const { roomId, displayName, peerId: existingPeerId } = req.body;
+  if (!roomId) return res.status(400).json({ error: 'Missing roomId' });
+
+  let room = rooms.get(roomId);
+  if (!room) {
+    room = {
+      id: roomId,
+      peers: new Map(),
+      wsPeers: new Map(),
+      createdAt: Date.now(),
+    };
+    rooms.set(roomId, room);
+  }
+
+  const peerId = existingPeerId || Math.random().toString(36).substring(2, 10);
+
+  if (room.peers.size >= 2 && !room.peers.has(peerId)) {
+    return res.status(403).json({
+      type: 'room-full',
+      message: 'This 1-on-1 direct call line is full (2 persons max).',
+    });
+  }
+
+  room.peers.set(peerId, {
+    id: peerId,
+    displayName: displayName || 'Peer',
+    lastActive: Date.now(),
   });
+
+  const existingPeers = Array.from(room.peers.values()).filter((p) => p.id !== peerId);
+
+  if (existingPeers.length > 0) {
+    broadcastToRoom(roomId, peerId, {
+      type: 'peer-joined',
+      peerId,
+      displayName: displayName || 'Peer',
+      peersCount: room.peers.size,
+    });
+  }
+
+  res.json({
+    type: 'room-joined',
+    roomId,
+    peerId,
+    peersCount: room.peers.size,
+    otherPeer: existingPeers[0] || null,
+  });
+});
+
+app.post('/api/signaling/send', (req, res) => {
+  const { roomId, senderId, signal } = req.body;
+  if (!roomId || !signal) return res.status(400).json({ error: 'Invalid payload' });
+
+  broadcastToRoom(roomId, senderId, signal);
+  res.json({ success: true });
+});
+
+app.get('/api/signaling/poll', (req, res) => {
+  const { roomId, peerId } = req.query as { roomId: string; peerId: string };
+  if (!peerId) return res.status(400).json({ error: 'Missing peerId' });
+
+  // Refresh active timestamp
+  if (roomId) {
+    const room = rooms.get(roomId);
+    if (room && room.peers.has(peerId)) {
+      const p = room.peers.get(peerId)!;
+      p.lastActive = Date.now();
+    }
+  }
+
+  const queue = signalQueues.get(peerId) || [];
+  const signals = [...queue];
+  signalQueues.set(peerId, []);
+
+  res.json({ signals });
 });
 
 app.get('/api/ice-servers', (req, res) => {
@@ -220,11 +314,19 @@ app.get('/api/ice-servers', (req, res) => {
       { urls: 'stun:stun2.l.google.com:19302' },
       { urls: 'stun:stun3.l.google.com:19302' },
       { urls: 'stun:stun4.l.google.com:19302' },
+      { urls: 'stun:global.stun.twilio.com:3478' },
     ],
   });
 });
 
-// Vite Integration
+app.get('/api/status', (req, res) => {
+  res.json({
+    status: 'online',
+    activeRooms: rooms.size,
+    timestamp: new Date().toISOString(),
+  });
+});
+
 async function startServer() {
   if (!isProd) {
     const vite = await createViteServer({

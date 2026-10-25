@@ -12,13 +12,15 @@ import { QRCodeModal } from './components/QRCodeModal';
 import { CallState, CallStats, ChatMessage, PeerInfo, CallLog } from './types/calling';
 import { WebRTCService } from './services/webrtcService';
 import { soundEffects } from './utils/soundEffects';
-import { AlertCircle, Lock, ShieldCheck } from 'lucide-react';
+import { AlertCircle, PhoneCall, ShieldCheck, User } from 'lucide-react';
 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<'line' | 'chamber' | 'history'>('line');
   const [callState, setCallState] = useState<CallState>('idle');
 
   const [activeLineId, setActiveLineId] = useState<string>('');
+  const [invitedLineId, setInvitedLineId] = useState<string | null>(null);
+
   const [myDisplayName, setMyDisplayName] = useState<string>(
     () => localStorage.getItem('duocall_name') || 'User ' + Math.floor(100 + Math.random() * 900)
   );
@@ -44,7 +46,7 @@ export default function App() {
   const [qrLineId, setQrLineId] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Call History & Post-Call Log
+  // Call History
   const [callHistory, setCallHistory] = useState<CallLog[]>(() => {
     try {
       const saved = localStorage.getItem('duocall_history');
@@ -56,78 +58,131 @@ export default function App() {
   const [lastCallLog, setLastCallLog] = useState<CallLog | null>(null);
   const callStartTimeRef = useRef<number>(0);
 
-  // WebSockets & WebRTC References
+  // Signaling References
   const wsRef = useRef<WebSocket | null>(null);
+  const pollIntervalRef = useRef<any>(null);
   const webrtcRef = useRef<WebRTCService | null>(null);
   const myPeerIdRef = useRef<string>('');
+  const activeRoomIdRef = useRef<string>('');
 
-  // 1. Check URL query parameters for direct line invitation (`?line=123456`)
+  // 1. Detect direct link invitation parameter (`?line=123456` or `?code=123456`)
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const lineParam = params.get('line') || params.get('code');
     if (lineParam) {
       setActiveLineId(lineParam);
-      setCurrentTab('line');
+      setInvitedLineId(lineParam);
     }
   }, []);
 
-  // Save history to localStorage
+  // Save history & name
   useEffect(() => {
     try {
       localStorage.setItem('duocall_history', JSON.stringify(callHistory));
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) {}
   }, [callHistory]);
 
-  // Save display name to localStorage
   useEffect(() => {
     if (myDisplayName) {
       localStorage.setItem('duocall_name', myDisplayName);
     }
   }, [myDisplayName]);
 
-  // Connect WebSocket Signaling Server
-  const connectWebSocket = (): WebSocket => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      return wsRef.current;
-    }
+  // Connect WebSocket & HTTP Polling Fallback
+  const connectSignaling = (roomId: string, displayName: string) => {
+    activeRoomIdRef.current = roomId;
 
+    // A. Connect WebSockets
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws`;
-    const ws = new WebSocket(wsUrl);
+    
+    if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
+      const ws = new WebSocket(wsUrl);
 
-    ws.onopen = () => {
-      console.log('WebSocket signaling connected');
-    };
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'join-room', roomId, displayName }));
+      };
 
-    ws.onmessage = async (event) => {
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          handleSignalingMessage(msg);
+        } catch (e) {}
+      };
+
+      wsRef.current = ws;
+    } else if (wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'join-room', roomId, displayName }));
+    }
+
+    // B. HTTP Fallback Join
+    fetch('/api/signaling/join', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId, displayName, peerId: myPeerIdRef.current }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.type === 'room-full') {
+          soundEffects.stopRinging();
+          setCallState('idle');
+          setErrorMessage(data.message);
+          return;
+        }
+
+        if (data.peerId && !myPeerIdRef.current) {
+          myPeerIdRef.current = data.peerId;
+        }
+
+        if (data.otherPeer) {
+          setPartnerInfo({ id: data.otherPeer.id, displayName: data.otherPeer.displayName });
+        }
+      })
+      .catch((e) => console.warn('HTTP Join error:', e));
+
+    // C. HTTP Polling Backup Safety Net
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    pollIntervalRef.current = setInterval(async () => {
+      if (!activeRoomIdRef.current || !myPeerIdRef.current) return;
       try {
-        const msg = JSON.parse(event.data);
-        handleSignalingMessage(msg);
-      } catch (err) {
-        console.error('Error handling signaling msg:', err);
-      }
-    };
-
-    ws.onclose = () => {
-      console.log('WebSocket signaling disconnected');
-    };
-
-    wsRef.current = ws;
-    return ws;
+        const res = await fetch(
+          `/api/signaling/poll?roomId=${activeRoomIdRef.current}&peerId=${myPeerIdRef.current}`
+        );
+        const data = await res.json();
+        if (data.signals && data.signals.length > 0) {
+          data.signals.forEach((sig: any) => handleSignalingMessage(sig));
+        }
+      } catch (e) {}
+    }, 1200);
   };
 
-  // WebSockets Message Dispatcher
+  const sendSignaling = (signal: any) => {
+    const roomId = activeRoomIdRef.current;
+    if (!roomId) return;
+
+    // Send via WS
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(signal));
+    }
+
+    // Send via HTTP POST
+    fetch('/api/signaling/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId, senderId: myPeerIdRef.current, signal }),
+    }).catch((e) => {});
+  };
+
+  // WebRTC Signal Processing
   const handleSignalingMessage = async (msg: any) => {
+    // Ignore signals originating from myself
+    if (msg.senderId && msg.senderId === myPeerIdRef.current) return;
+
     switch (msg.type) {
       case 'room-joined': {
         myPeerIdRef.current = msg.peerId;
         if (msg.otherPeer) {
-          setPartnerInfo({
-            id: msg.otherPeer.id,
-            displayName: msg.otherPeer.displayName,
-          });
+          setPartnerInfo({ id: msg.otherPeer.id, displayName: msg.otherPeer.displayName });
         }
         break;
       }
@@ -135,45 +190,27 @@ export default function App() {
       case 'room-full': {
         soundEffects.stopRinging();
         setCallState('idle');
-        setErrorMessage(msg.message || 'This 1-on-1 direct line is already full (2 persons max).');
+        setErrorMessage(msg.message || 'This direct call line is full (maximum 2 participants allowed).');
         setTimeout(() => setErrorMessage(null), 5000);
         break;
       }
 
       case 'peer-joined': {
-        setPartnerInfo({
-          id: msg.peerId,
-          displayName: msg.displayName,
-        });
+        setPartnerInfo({ id: msg.peerId, displayName: msg.displayName });
 
-        // Add system message
-        addChatMessage({
-          id: Math.random().toString(),
-          senderId: 'system',
-          senderName: 'System',
-          text: `${msg.displayName} joined the line.`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          isSystem: true,
-        });
-
-        // If I am waiting in dialing mode, trigger WebRTC Offer!
-        if (callState === 'dialing' && webrtcRef.current) {
-          const offer = await webrtcRef.current.createOffer();
-          sendSignaling({ type: 'offer', offer });
+        // Trigger offer if I am in dialing state or host
+        if (webrtcRef.current) {
+          try {
+            const offer = await webrtcRef.current.createOffer();
+            sendSignaling({ type: 'offer', offer });
+          } catch (e) {
+            console.error('Error creating offer on peer-joined:', e);
+          }
         }
         break;
       }
 
       case 'peer-left': {
-        addChatMessage({
-          id: Math.random().toString(),
-          senderId: 'system',
-          senderName: 'System',
-          text: `${msg.displayName || 'Partner'} left the call line.`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          isSystem: true,
-        });
-
         if (callState === 'connected' || callState === 'dialing') {
           handleEndCall();
         }
@@ -181,23 +218,22 @@ export default function App() {
       }
 
       case 'offer': {
-        if (!webrtcRef.current) initWebRTCService();
-        const answer = await webrtcRef.current!.handleOffer(msg.offer);
+        const service = initWebRTCService();
+
+        // Ensure local stream is attached if available
+        if (localStream) {
+          service.setLocalStream(localStream);
+        }
+
+        const answer = await service.handleOffer(msg.offer);
         sendSignaling({ type: 'answer', answer });
 
-        if (callState !== 'connected') {
-          setPartnerInfo({
-            id: msg.senderId,
-            displayName: msg.senderName || 'Partner',
-          });
-          setCallState('incoming');
-        }
-        break;
-      }
+        setPartnerInfo({
+          id: msg.senderId,
+          displayName: msg.senderName || 'Partner',
+        });
 
-      case 'answer': {
-        if (webrtcRef.current) {
-          await webrtcRef.current.handleAnswer(msg.answer);
+        if (callState !== 'connected') {
           setCallState('connected');
           callStartTimeRef.current = Date.now();
           soundEffects.playCallConnected();
@@ -205,20 +241,21 @@ export default function App() {
         break;
       }
 
-      case 'ice-candidate': {
+      case 'answer': {
         if (webrtcRef.current) {
-          await webrtcRef.current.handleIceCandidate(msg.candidate);
+          await webrtcRef.current.handleAnswer(msg.answer);
+          if (callState !== 'connected') {
+            setCallState('connected');
+            callStartTimeRef.current = Date.now();
+            soundEffects.playCallConnected();
+          }
         }
         break;
       }
 
-      case 'call-ring': {
-        if (callState === 'idle' || callState === 'chamber') {
-          setPartnerInfo({
-            id: msg.senderId,
-            displayName: msg.senderName || 'Partner',
-          });
-          setCallState('incoming');
+      case 'ice-candidate': {
+        if (webrtcRef.current) {
+          await webrtcRef.current.handleIceCandidate(msg.candidate);
         }
         break;
       }
@@ -235,7 +272,7 @@ export default function App() {
         soundEffects.stopRinging();
         soundEffects.playCallEnded();
         setCallState('idle');
-        setErrorMessage('Call partner declined the incoming call.');
+        setErrorMessage('Call partner declined the direct call.');
         setTimeout(() => setErrorMessage(null), 4000);
         break;
       }
@@ -260,14 +297,8 @@ export default function App() {
     }
   };
 
-  const sendSignaling = (payload: any) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(payload));
-    }
-  };
-
-  // WebRTC Service Initialization
-  const initWebRTCService = () => {
+  // WebRTC Instance Setup
+  const initWebRTCService = (): WebRTCService => {
     if (webrtcRef.current) return webrtcRef.current;
 
     const instance = new WebRTCService({
@@ -293,8 +324,6 @@ export default function App() {
         if (state === 'connected') {
           setCallState('connected');
           callStartTimeRef.current = Date.now();
-        } else if (state === 'failed' || state === 'disconnected') {
-          // Attempt recovery or notify
         }
       },
     });
@@ -304,105 +333,64 @@ export default function App() {
   };
 
   const addChatMessage = (msg: ChatMessage) => {
-    setMessages((prev) => [...prev, msg]);
+    setMessages((prev) => {
+      if (prev.some((m) => m.id === msg.id)) return prev;
+      return [...prev, msg];
+    });
+
     if (!isChatOpen) {
       setUnreadCount((prev) => prev + 1);
     }
   };
 
-  // Start Call (Host or Receiver)
+  // Main Call Handler: Starts dialing or connecting to line
   const handleStartCall = async (lineId: string, name: string, isHost: boolean) => {
     setActiveLineId(lineId);
     setMyDisplayName(name);
 
-    // Acquire local stream if not already acquired
+    // 1. Get User Media Stream (mic + camera)
     let stream = localStream;
     if (!stream) {
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         setLocalStream(stream);
       } catch (err) {
-        console.error('Failed to get media devices:', err);
-        setErrorMessage('Camera or Microphone access required for calling.');
+        console.error('Failed to get camera/mic permissions:', err);
+        setErrorMessage('Camera & Microphone access is required for 1-on-1 calling.');
         return;
       }
     }
 
-    const ws = connectWebSocket();
+    // 2. Initialize WebRTC Service
     const service = initWebRTCService();
     service.setLocalStream(stream);
 
-    // Join WS signaling room for this 1-on-1 line
-    const joinMsg = () => {
-      ws.send(
-        JSON.stringify({
-          type: 'join-room',
-          roomId: lineId,
-          displayName: name,
-        })
-      );
-    };
-
-    if (ws.readyState === WebSocket.OPEN) {
-      joinMsg();
-    } else {
-      ws.onopen = () => joinMsg();
-    }
+    // 3. Connect Dual Signaling
+    connectSignaling(lineId, name);
 
     if (isHost) {
       setCallState('dialing');
       sendSignaling({ type: 'call-ring' });
     } else {
+      setCallState('dialing');
       sendSignaling({ type: 'call-accept' });
-      setCallState('connected');
-      callStartTimeRef.current = Date.now();
-      soundEffects.playCallConnected();
-    }
-  };
 
-  // Accept Incoming Call
-  const handleAcceptIncomingCall = async () => {
-    soundEffects.stopRinging();
-    let stream = localStream;
-    if (!stream) {
+      // Create offer if partner is already waiting
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        setLocalStream(stream);
-      } catch (err) {
-        console.error('Failed to get media stream:', err);
-        setErrorMessage('Camera or Microphone access required.');
-        return;
-      }
+        const offer = await service.createOffer();
+        sendSignaling({ type: 'offer', offer });
+      } catch (e) {}
     }
-
-    const service = initWebRTCService();
-    service.setLocalStream(stream);
-
-    sendSignaling({ type: 'call-accept' });
-    setCallState('connected');
-    callStartTimeRef.current = Date.now();
-    soundEffects.playCallConnected();
   };
 
-  // Decline Incoming Call
-  const handleDeclineIncomingCall = () => {
-    soundEffects.stopRinging();
-    sendSignaling({ type: 'call-decline' });
-    setCallState('idle');
-  };
-
-  // Cancel Outgoing Dialing
-  const handleCancelDialing = () => {
-    soundEffects.stopRinging();
-    sendSignaling({ type: 'leave-room' });
-    setCallState('idle');
-  };
-
-  // End Active Call
   const handleEndCall = () => {
     soundEffects.playCallEnded();
     sendSignaling({ type: 'call-hangup' });
-    sendSignaling({ type: 'leave-room' });
+
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
 
     const durationSeconds = callStartTimeRef.current
       ? Math.round((Date.now() - callStartTimeRef.current) / 1000)
@@ -429,7 +417,6 @@ export default function App() {
     setCallState('ended');
   };
 
-  // In-Call Media Control Toggles
   const handleToggleMute = () => {
     const newMuted = !isMuted;
     setIsMuted(newMuted);
@@ -478,12 +465,11 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-slate-950">
-      {/* Top Header */}
       <Header
         currentTab={currentTab}
         onSelectTab={(tab) => {
           if (callState === 'connected') {
-            if (confirm('Leave current active 1-on-1 call?')) {
+            if (confirm('Leave active 1-on-1 call?')) {
               handleEndCall();
               setCurrentTab(tab);
             }
@@ -496,11 +482,12 @@ export default function App() {
         onQuickLine={() => {
           const newCode = Math.floor(100000 + Math.random() * 900000).toString();
           setActiveLineId(newCode);
+          setInvitedLineId(null);
           setCurrentTab('line');
         }}
       />
 
-      {/* Global Error Banner Toast */}
+      {/* Global Toast Error Banner */}
       {errorMessage && (
         <div className="bg-red-950/90 border-b border-red-800 text-red-200 px-4 py-3 text-xs font-semibold flex items-center justify-center gap-2 animate-fadeIn">
           <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
@@ -508,28 +495,59 @@ export default function App() {
         </div>
       )}
 
-      {/* Active 1-on-1 Calling Screen overlays */}
+      {/* Direct Invitation Link Banner */}
+      {invitedLineId && callState === 'idle' && (
+        <div className="bg-gradient-to-r from-cyan-950 via-slate-900 to-indigo-950 border-b border-cyan-800/80 p-4 text-center flex flex-col sm:flex-row items-center justify-center gap-3 shadow-lg">
+          <PhoneCall className="w-5 h-5 text-cyan-400 animate-bounce" />
+          <span className="text-xs sm:text-sm font-semibold text-slate-200">
+            You were invited to join Direct 1-on-1 Call Line:{' '}
+            <strong className="text-cyan-400 font-mono tracking-wider">{invitedLineId}</strong>
+          </span>
+          <button
+            onClick={() => handleStartCall(invitedLineId, myDisplayName, false)}
+            className="px-4 py-2 bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs rounded-xl shadow-md transition-all shrink-0"
+          >
+            Connect to Line Now
+          </button>
+        </div>
+      )}
+
+      {/* Outgoing Dialing Overlay */}
       {callState === 'dialing' && (
         <CallingScreen
           mode="dialing"
           lineId={activeLineId}
-          partnerName={partnerInfo?.displayName || 'Calling Partner...'}
-          onCancelCall={handleCancelDialing}
-          onDeclineCall={handleCancelDialing}
+          partnerName={partnerInfo?.displayName || 'Waiting for Partner...'}
+          onCancelCall={() => {
+            soundEffects.stopRinging();
+            setCallState('idle');
+          }}
+          onDeclineCall={() => {
+            soundEffects.stopRinging();
+            setCallState('idle');
+          }}
         />
       )}
 
+      {/* Incoming Call Overlay */}
       {callState === 'incoming' && (
         <CallingScreen
           mode="incoming"
           lineId={activeLineId}
-          partnerName={partnerInfo?.displayName || 'Incoming Call Partner'}
-          onAcceptCall={handleAcceptIncomingCall}
-          onDeclineCall={handleDeclineIncomingCall}
-          onCancelCall={handleDeclineIncomingCall}
+          partnerName={partnerInfo?.displayName || 'Incoming Partner'}
+          onAcceptCall={() => handleStartCall(activeLineId, myDisplayName, false)}
+          onDeclineCall={() => {
+            soundEffects.stopRinging();
+            setCallState('idle');
+          }}
+          onCancelCall={() => {
+            soundEffects.stopRinging();
+            setCallState('idle');
+          }}
         />
       )}
 
+      {/* Active Connected Call Screen */}
       {callState === 'connected' && (
         <div className="flex-1 relative flex overflow-hidden">
           <div className="flex-1">
@@ -575,7 +593,6 @@ export default function App() {
             />
           </div>
 
-          {/* Right Side In-Call Chat Drawer */}
           {isChatOpen && (
             <InCallChat
               messages={messages}
@@ -587,7 +604,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Post-Call Summary Screen */}
+      {/* Call Ended Summary */}
       {callState === 'ended' && lastCallLog && (
         <CallEndedSummary
           callLog={lastCallLog}
@@ -606,7 +623,7 @@ export default function App() {
         />
       )}
 
-      {/* Main Tab Content when call is idle */}
+      {/* Main Home Screens */}
       {callState === 'idle' && (
         <main className="flex-1">
           {currentTab === 'line' && (
@@ -643,12 +660,11 @@ export default function App() {
         </main>
       )}
 
-      {/* Network Stats Modal */}
+      {/* Modals */}
       {isStatsOpen && (
         <CallStatsModal stats={stats} onClose={() => setIsStatsOpen(false)} />
       )}
 
-      {/* QR Code Modal */}
       {qrLineId && (
         <QRCodeModal lineId={qrLineId} onClose={() => setQrLineId(null)} />
       )}
@@ -662,7 +678,7 @@ export default function App() {
         <div className="flex items-center gap-4 text-slate-500">
           <span>Max 2 Participants per Line</span>
           <span>·</span>
-          <span>Direct WebRTC P2P</span>
+          <span>WebRTC HD P2P + HTTP Polling Backup</span>
         </div>
       </footer>
     </div>
