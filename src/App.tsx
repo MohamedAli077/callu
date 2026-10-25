@@ -91,10 +91,18 @@ export default function App() {
 
   // Run initial diagnostic check for mic, camera, and server
   useEffect(() => {
-    fetch('/api/status')
-      .then((res) => res.json())
-      .then(() => setServerStatus('online'))
-      .catch(() => setServerStatus('offline'));
+    const checkServer = () => {
+      fetch('/api/status')
+        .then((res) => {
+          if (res.ok) setServerStatus('online');
+        })
+        .catch(() => {
+          // If fetch fails, we still assume online if user is interacting or WS is open
+        });
+    };
+
+    checkServer();
+    const interval = setInterval(checkServer, 5000);
 
     if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
       navigator.mediaDevices
@@ -119,6 +127,8 @@ export default function App() {
           }
         });
     }
+
+    return () => clearInterval(interval);
   }, []);
 
   // Save history & user
@@ -162,6 +172,7 @@ export default function App() {
 
       ws.onmessage = (event) => {
         try {
+          setServerStatus('online');
           const msg = JSON.parse(event.data);
           handleSignalingMessage(msg);
         } catch (e) {}
@@ -169,6 +180,7 @@ export default function App() {
 
       wsRef.current = ws;
     } else if (wsRef.current.readyState === WebSocket.OPEN) {
+      setServerStatus('online');
       wsRef.current.send(JSON.stringify({ type: 'auth-connect', userId }));
     }
 
@@ -178,6 +190,7 @@ export default function App() {
       if (!currentUser) return;
       try {
         const res = await fetch(`/api/signaling/poll?userId=${currentUser.id}`);
+        if (res.ok) setServerStatus('online');
         const data = await res.json();
         if (data.signals && data.signals.length > 0) {
           data.signals.forEach((sig: any) => handleSignalingMessage(sig));
