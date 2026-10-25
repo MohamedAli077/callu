@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Header } from './components/Header';
-import { LineManager } from './components/LineManager';
+import { LoginScreen } from './components/LoginScreen';
+import { DirectDashboard } from './components/DirectDashboard';
 import { DeviceSetupChamber } from './components/DeviceSetupChamber';
 import { CallingScreen } from './components/CallingScreen';
 import { InCallView } from './components/InCallView';
@@ -13,20 +14,29 @@ import { CallState, CallStats, ChatMessage, PeerInfo, CallLog } from './types/ca
 import { WebRTCService } from './services/webrtcService';
 import { AudioBridge } from './utils/audioBridge';
 import { soundEffects } from './utils/soundEffects';
-import { AlertCircle, PhoneCall, ShieldCheck, Activity, Check, Mic, Video, Radio } from 'lucide-react';
+import { AlertCircle, ShieldCheck, Activity, Mic, Video, Radio } from 'lucide-react';
 
 export default function App() {
+  const [currentUser, setCurrentUser] = useState<{ id: string; email: string; displayName: string } | null>(() => {
+    try {
+      const saved = localStorage.getItem('duocall_user');
+      return saved ? JSON.parse(saved) : null;
+    } catch (e) {
+      return null;
+    }
+  });
+
+  const [partnerUser, setPartnerUser] = useState<{
+    id: string;
+    email: string;
+    displayName: string;
+    isOnline: boolean;
+    status: string;
+  } | null>(null);
+
   const [currentTab, setCurrentTab] = useState<'line' | 'chamber' | 'history'>('line');
   const [callState, setCallState] = useState<CallState>('idle');
 
-  const [activeLineId, setActiveLineId] = useState<string>('');
-  const [invitedLineId, setInvitedLineId] = useState<string | null>(null);
-
-  const [myDisplayName, setMyDisplayName] = useState<string>(
-    () => localStorage.getItem('duocall_name') || 'User ' + Math.floor(100 + Math.random() * 900)
-  );
-
-  const [partnerInfo, setPartnerInfo] = useState<PeerInfo | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
 
@@ -51,8 +61,7 @@ export default function App() {
   const [isStatsOpen, setIsStatsOpen] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
 
-  // Modals & Banners
-  const [qrLineId, setQrLineId] = useState<string | null>(null);
+  // Error Banner
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Call History
@@ -72,22 +81,21 @@ export default function App() {
   const pollIntervalRef = useRef<any>(null);
   const webrtcRef = useRef<WebRTCService | null>(null);
   const audioBridgeRef = useRef<AudioBridge | null>(null);
-  const myPeerIdRef = useRef<string>('');
-  const activeRoomIdRef = useRef<string>('');
 
   const logStep = (msg: string) => {
-    setConnectionLogs((prev) => [...prev.slice(-4), `${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}: ${msg}`]);
+    setConnectionLogs((prev) => [
+      ...prev.slice(-4),
+      `${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}: ${msg}`,
+    ]);
   };
 
   // Run initial diagnostic check for mic, camera, and server
   useEffect(() => {
-    // Check server status
     fetch('/api/status')
       .then((res) => res.json())
       .then(() => setServerStatus('online'))
       .catch(() => setServerStatus('offline'));
 
-    // Check media permissions
     if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
       navigator.mediaDevices
         .getUserMedia({ audio: true, video: true })
@@ -101,7 +109,6 @@ export default function App() {
             setMicStatus('denied');
             setCamStatus('denied');
           } else {
-            // Try audio only
             navigator.mediaDevices
               .getUserMedia({ audio: true })
               .then((s) => {
@@ -112,17 +119,25 @@ export default function App() {
           }
         });
     }
-
-    // Check URL parameters for invitation (`?line=123456`)
-    const params = new URLSearchParams(window.location.search);
-    const lineParam = params.get('line') || params.get('code');
-    if (lineParam) {
-      setActiveLineId(lineParam);
-      setInvitedLineId(lineParam);
-    }
   }, []);
 
-  // Initialize Fallback Audio Bridge
+  // Save history & user
+  useEffect(() => {
+    try {
+      localStorage.setItem('duocall_history', JSON.stringify(callHistory));
+    } catch (e) {}
+  }, [callHistory]);
+
+  useEffect(() => {
+    if (currentUser) {
+      localStorage.setItem('duocall_user', JSON.stringify(currentUser));
+      connectUserSignaling(currentUser.id);
+    } else {
+      localStorage.removeItem('duocall_user');
+    }
+  }, [currentUser]);
+
+  // Fallback Audio Bridge
   useEffect(() => {
     audioBridgeRef.current = new AudioBridge((base64Chunk) => {
       sendSignaling({
@@ -132,24 +147,8 @@ export default function App() {
     });
   }, []);
 
-  // Save history & name
-  useEffect(() => {
-    try {
-      localStorage.setItem('duocall_history', JSON.stringify(callHistory));
-    } catch (e) {}
-  }, [callHistory]);
-
-  useEffect(() => {
-    if (myDisplayName) {
-      localStorage.setItem('duocall_name', myDisplayName);
-    }
-  }, [myDisplayName]);
-
-  // Connect Signaling
-  const connectSignaling = (roomId: string, displayName: string) => {
-    activeRoomIdRef.current = roomId;
-    logStep(`Connecting line: ${roomId}...`);
-
+  // Connect Signaling for Logged In User
+  const connectUserSignaling = (userId: string) => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws`;
 
@@ -157,9 +156,8 @@ export default function App() {
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        logStep('WebSocket signaling active');
         setServerStatus('online');
-        ws.send(JSON.stringify({ type: 'join-room', roomId, displayName }));
+        ws.send(JSON.stringify({ type: 'auth-connect', userId }));
       };
 
       ws.onmessage = (event) => {
@@ -171,43 +169,15 @@ export default function App() {
 
       wsRef.current = ws;
     } else if (wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'join-room', roomId, displayName }));
+      wsRef.current.send(JSON.stringify({ type: 'auth-connect', userId }));
     }
 
-    // HTTP Join Fallback
-    fetch('/api/signaling/join', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomId, displayName, peerId: myPeerIdRef.current }),
-    })
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.type === 'room-full') {
-          soundEffects.stopRinging();
-          setCallState('idle');
-          setErrorMessage(data.message);
-          return;
-        }
-
-        if (data.peerId && !myPeerIdRef.current) {
-          myPeerIdRef.current = data.peerId;
-        }
-
-        if (data.otherPeer) {
-          logStep(`Partner online: ${data.otherPeer.displayName}`);
-          setPartnerInfo({ id: data.otherPeer.id, displayName: data.otherPeer.displayName });
-        }
-      })
-      .catch((e) => console.warn('HTTP Join error:', e));
-
-    // HTTP Polling Fallback Safety Net
+    // HTTP Polling Fallback
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     pollIntervalRef.current = setInterval(async () => {
-      if (!activeRoomIdRef.current || !myPeerIdRef.current) return;
+      if (!currentUser) return;
       try {
-        const res = await fetch(
-          `/api/signaling/poll?roomId=${activeRoomIdRef.current}&peerId=${myPeerIdRef.current}`
-        );
+        const res = await fetch(`/api/signaling/poll?userId=${currentUser.id}`);
         const data = await res.json();
         if (data.signals && data.signals.length > 0) {
           data.signals.forEach((sig: any) => handleSignalingMessage(sig));
@@ -217,49 +187,50 @@ export default function App() {
   };
 
   const sendSignaling = (signal: any) => {
-    const roomId = activeRoomIdRef.current;
-    if (!roomId) return;
+    if (!currentUser) return;
+    const targetUserId = currentUser.id === 'user1' ? 'user2' : 'user1';
+
+    const payload = {
+      ...signal,
+      senderId: currentUser.id,
+      targetUserId,
+    };
 
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(signal));
+      wsRef.current.send(JSON.stringify(payload));
     }
 
     fetch('/api/signaling/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomId, senderId: myPeerIdRef.current, signal }),
+      body: JSON.stringify({ targetUserId, signal: payload }),
     }).catch((e) => {});
   };
 
-  // WebRTC & Audio Bridge Signal Handler
+  // Signal Message Handler
   const handleSignalingMessage = async (msg: any) => {
-    if (msg.senderId && msg.senderId === myPeerIdRef.current) return;
-
     switch (msg.type) {
-      case 'room-joined': {
-        myPeerIdRef.current = msg.peerId;
-        logStep('Line connected. Ready for partner.');
-        if (msg.otherPeer) {
-          setPartnerInfo({ id: msg.otherPeer.id, displayName: msg.otherPeer.displayName });
+      case 'presence-update': {
+        if (msg.users && currentUser) {
+          const p = msg.users.find((u: any) => u.id !== currentUser.id);
+          if (p) {
+            setPartnerUser(p);
+          }
         }
         break;
       }
 
-      case 'room-full': {
-        soundEffects.stopRinging();
-        setCallState('idle');
-        setErrorMessage(msg.message || 'This line is full (maximum 2 participants allowed).');
-        setTimeout(() => setErrorMessage(null), 5000);
+      case 'incoming-call': {
+        logStep(`Incoming call from ${msg.caller?.displayName || 'Partner'}`);
+        setCallState('incoming');
         break;
       }
 
-      case 'peer-joined': {
-        logStep(`Partner joined line: ${msg.displayName}`);
-        setPartnerInfo({ id: msg.peerId, displayName: msg.displayName });
-
+      case 'call-accepted': {
+        logStep('Partner accepted call! Connecting media...');
+        soundEffects.stopRinging();
         if (webrtcRef.current) {
           try {
-            logStep('Connecting HD Peer Stream...');
             const offer = await webrtcRef.current.createOffer();
             sendSignaling({ type: 'offer', offer });
           } catch (e) {}
@@ -267,11 +238,17 @@ export default function App() {
         break;
       }
 
-      case 'peer-left': {
-        logStep('Partner left line');
-        if (callState === 'connected' || callState === 'dialing') {
-          handleEndCall();
-        }
+      case 'call-declined': {
+        soundEffects.stopRinging();
+        soundEffects.playCallEnded();
+        setCallState('idle');
+        setErrorMessage('Partner declined the call.');
+        setTimeout(() => setErrorMessage(null), 4000);
+        break;
+      }
+
+      case 'call-ended': {
+        handleEndCall();
         break;
       }
 
@@ -286,11 +263,6 @@ export default function App() {
         const answer = await service.handleOffer(msg.offer);
         sendSignaling({ type: 'answer', answer });
 
-        setPartnerInfo({
-          id: msg.senderId,
-          displayName: msg.senderName || 'Partner',
-        });
-
         if (callState !== 'connected') {
           setCallState('connected');
           callStartTimeRef.current = Date.now();
@@ -300,7 +272,7 @@ export default function App() {
       }
 
       case 'answer': {
-        logStep('Stream Answered. Call Connected!');
+        logStep('Call Connected!');
         if (webrtcRef.current) {
           await webrtcRef.current.handleAnswer(msg.answer);
           if (callState !== 'connected') {
@@ -319,31 +291,7 @@ export default function App() {
         break;
       }
 
-      case 'call-accept': {
-        logStep('Partner accepted call.');
-        if (webrtcRef.current && callState === 'dialing') {
-          const offer = await webrtcRef.current.createOffer();
-          sendSignaling({ type: 'offer', offer });
-        }
-        break;
-      }
-
-      case 'call-decline': {
-        soundEffects.stopRinging();
-        soundEffects.playCallEnded();
-        setCallState('idle');
-        setErrorMessage('Call partner declined the call.');
-        setTimeout(() => setErrorMessage(null), 4000);
-        break;
-      }
-
-      case 'call-hangup': {
-        handleEndCall();
-        break;
-      }
-
       case 'media-state': {
-        setPartnerInfo((prev) => (prev ? { ...prev, ...msg.state } : null));
         break;
       }
 
@@ -352,7 +300,6 @@ export default function App() {
         break;
       }
 
-      // Live Fallback Voice Stream Packet
       case 'media-chunk': {
         if (msg.chunk && audioBridgeRef.current) {
           audioBridgeRef.current.playIncomingAudioChunk(msg.chunk);
@@ -370,7 +317,7 @@ export default function App() {
 
     const instance = new WebRTCService({
       onRemoteStream: (stream) => {
-        logStep('HD Audio/Video Active!');
+        logStep('HD Stream active!');
         setRemoteStream(stream);
       },
       onRemoteStreamEnded: () => {
@@ -379,9 +326,7 @@ export default function App() {
       onChatMessage: (msg) => {
         addChatMessage(msg);
       },
-      onPeerMediaStateChange: (state) => {
-        setPartnerInfo((prev) => (prev ? { ...prev, ...state } : null));
-      },
+      onPeerMediaStateChange: () => {},
       onStatsUpdate: (newStats) => {
         setStats(newStats);
       },
@@ -389,7 +334,7 @@ export default function App() {
         sendSignaling(signal);
       },
       onConnectionStateChange: (state) => {
-        logStep(`P2P Status: ${state}`);
+        logStep(`Status: ${state}`);
         if (state === 'connected') {
           setCallState('connected');
           callStartTimeRef.current = Date.now();
@@ -412,27 +357,27 @@ export default function App() {
     }
   };
 
-  const handleStartCall = async (lineId: string, name: string, isHost: boolean) => {
-    setActiveLineId(lineId);
-    setMyDisplayName(name);
+  // Direct Call Action: "CALL PARTNER NOW"
+  const handleInitiateCall = async (callType: 'video' | 'audio') => {
+    if (!currentUser) return;
+    const targetUserId = currentUser.id === 'user1' ? 'user2' : 'user1';
+
+    setIsVideoOff(callType === 'audio');
     setConnectionLogs([]);
     logStep('Initializing camera & microphone...');
 
     let stream = localStream;
     if (!stream) {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: callType === 'video',
+          audio: true,
+        });
         setLocalStream(stream);
         setMicStatus('ok');
         setCamStatus('ok');
-        logStep('Camera & Mic granted');
       } catch (err: any) {
-        console.error('Failed media capture:', err);
-        setErrorMessage(
-          err.name === 'NotAllowedError'
-            ? 'Camera/Mic permission denied. Please click the lock icon in your browser address bar and allow Camera and Microphone.'
-            : 'Could not access camera/mic. Please check your device settings.'
-        );
+        setErrorMessage('Camera or Microphone access required for calling.');
         return;
       }
     }
@@ -440,48 +385,110 @@ export default function App() {
     const service = initWebRTCService();
     service.setLocalStream(stream);
 
-    // Start Fallback Audio Bridge
     if (audioBridgeRef.current && stream) {
       audioBridgeRef.current.startCapture(stream);
     }
 
-    connectSignaling(lineId, name);
+    setCallState('dialing');
 
-    if (isHost) {
-      setCallState('dialing');
-      sendSignaling({ type: 'call-ring' });
-    } else {
-      setCallState('dialing');
-      sendSignaling({ type: 'call-accept' });
-
-      try {
-        const offer = await service.createOffer();
-        sendSignaling({ type: 'offer', offer });
-      } catch (e) {}
+    // Notify Server & Target
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'direct-call-init',
+          callerId: currentUser.id,
+          targetUserId,
+        })
+      );
     }
+  };
+
+  const handleAcceptIncomingCall = async () => {
+    if (!currentUser) return;
+    soundEffects.stopRinging();
+
+    let stream = localStream;
+    if (!stream) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        setLocalStream(stream);
+      } catch (err) {
+        setErrorMessage('Microphone and Camera permission required.');
+        return;
+      }
+    }
+
+    const service = initWebRTCService();
+    service.setLocalStream(stream);
+
+    if (audioBridgeRef.current && stream) {
+      audioBridgeRef.current.startCapture(stream);
+    }
+
+    const targetUserId = currentUser.id === 'user1' ? 'user2' : 'user1';
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'direct-call-accept',
+          callerId: targetUserId,
+          responderId: currentUser.id,
+        })
+      );
+    }
+
+    setCallState('connected');
+    callStartTimeRef.current = Date.now();
+    soundEffects.playCallConnected();
+  };
+
+  const handleDeclineIncomingCall = () => {
+    if (!currentUser) return;
+    soundEffects.stopRinging();
+    const targetUserId = currentUser.id === 'user1' ? 'user2' : 'user1';
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'direct-call-decline',
+          callerId: targetUserId,
+          responderId: currentUser.id,
+        })
+      );
+    }
+
+    setCallState('idle');
   };
 
   const handleEndCall = () => {
     soundEffects.playCallEnded();
-    sendSignaling({ type: 'call-hangup' });
+
+    if (currentUser) {
+      const partnerId = currentUser.id === 'user1' ? 'user2' : 'user1';
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'direct-call-end',
+            userId: currentUser.id,
+            partnerId,
+          })
+        );
+      }
+    }
 
     if (audioBridgeRef.current) {
       audioBridgeRef.current.stopCapture();
-    }
-
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
     }
 
     const durationSeconds = callStartTimeRef.current
       ? Math.round((Date.now() - callStartTimeRef.current) / 1000)
       : 0;
 
+    const partnerName = partnerUser?.displayName || (currentUser?.id === 'user1' ? 'Person 2' : 'Person 1');
+
     const newLog: CallLog = {
       id: Math.random().toString(36).substring(2, 9),
-      lineId: activeLineId,
-      partnerName: partnerInfo?.displayName || 'Partner',
+      lineId: '1-on-1 Line',
+      partnerName,
       startTime: callStartTimeRef.current || Date.now(),
       endTime: Date.now(),
       durationSeconds: Math.max(durationSeconds, 1),
@@ -530,10 +537,11 @@ export default function App() {
   };
 
   const handleSendChatMessage = (text: string, file?: any) => {
+    if (!currentUser) return;
     const newMsg: ChatMessage = {
       id: Math.random().toString(36).substring(2, 9),
-      senderId: myPeerIdRef.current || 'me',
-      senderName: myDisplayName,
+      senderId: currentUser.id,
+      senderName: currentUser.displayName,
       text,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       file,
@@ -545,13 +553,34 @@ export default function App() {
     }
   };
 
+  const handleUpdateDisplayName = async (newName: string) => {
+    if (!currentUser) return;
+    try {
+      const res = await fetch('/api/auth/update-profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUser.id, displayName: newName }),
+      });
+      if (res.ok) {
+        setCurrentUser({ ...currentUser, displayName: newName });
+      }
+    } catch (e) {}
+  };
+
+  // 1. If not logged in -> Show LoginScreen
+  if (!currentUser) {
+    return <LoginScreen onLoginSuccess={(user) => setCurrentUser(user)} />;
+  }
+
+  const partnerName = partnerUser?.displayName || (currentUser.id === 'user1' ? 'Person 2 (Partner)' : 'Person 1 (Mohamed)');
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-slate-950">
       <Header
         currentTab={currentTab}
         onSelectTab={(tab) => {
           if (callState === 'connected') {
-            if (confirm('Leave active 1-on-1 call?')) {
+            if (confirm('Leave active call?')) {
               handleEndCall();
               setCurrentTab(tab);
             }
@@ -560,13 +589,8 @@ export default function App() {
           }
         }}
         callState={callState}
-        activeLineId={activeLineId}
-        onQuickLine={() => {
-          const newCode = Math.floor(100000 + Math.random() * 900000).toString();
-          setActiveLineId(newCode);
-          setInvitedLineId(null);
-          setCurrentTab('line');
-        }}
+        activeLineId="1-on-1 Direct Line"
+        onQuickLine={() => handleInitiateCall('video')}
       />
 
       {/* Real-time System Readiness Bar */}
@@ -583,82 +607,38 @@ export default function App() {
 
         <div className="flex items-center gap-1.5">
           <Radio className={`w-3.5 h-3.5 ${serverStatus === 'online' ? 'text-emerald-400' : 'text-red-400'}`} />
-          <span>DuoCall Server: {serverStatus === 'online' ? 'Connected' : 'Connecting...'}</span>
+          <span>Server: {serverStatus === 'online' ? 'Connected' : 'Connecting...'}</span>
         </div>
       </div>
 
-      {/* Global Toast Error Banner */}
+      {/* Global Error Toast */}
       {errorMessage && (
-        <div className="bg-red-950/90 border-b border-red-800 text-red-200 px-4 py-3 text-xs font-semibold flex items-center justify-center gap-2 animate-fadeIn">
+        <div className="bg-red-950/90 border-b border-red-800 text-red-200 px-4 py-3 text-xs font-semibold flex items-center justify-center gap-2">
           <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
           <span>{errorMessage}</span>
         </div>
       )}
 
-      {/* Direct Invitation Banner */}
-      {invitedLineId && callState === 'idle' && (
-        <div className="bg-gradient-to-r from-cyan-950 via-slate-900 to-indigo-950 border-b border-cyan-800/80 p-4 text-center flex flex-col sm:flex-row items-center justify-center gap-3 shadow-lg">
-          <PhoneCall className="w-5 h-5 text-cyan-400 animate-bounce" />
-          <span className="text-xs sm:text-sm font-semibold text-slate-200">
-            Invited to Direct 1-on-1 Line:{' '}
-            <strong className="text-cyan-400 font-mono tracking-wider">{invitedLineId}</strong>
-          </span>
-          <button
-            onClick={() => handleStartCall(invitedLineId, myDisplayName, false)}
-            className="px-4 py-2 bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs rounded-xl shadow-md transition-all shrink-0"
-          >
-            Connect to Line Now
-          </button>
-        </div>
-      )}
-
-      {/* Outgoing Dialing Overlay */}
+      {/* Outgoing Calling Screen */}
       {callState === 'dialing' && (
-        <div className="relative">
-          <CallingScreen
-            mode="dialing"
-            lineId={activeLineId}
-            partnerName={partnerInfo?.displayName || 'Waiting for Partner...'}
-            onCancelCall={() => {
-              soundEffects.stopRinging();
-              setCallState('idle');
-            }}
-            onDeclineCall={() => {
-              soundEffects.stopRinging();
-              setCallState('idle');
-            }}
-          />
-
-          {/* Connection Console */}
-          <div className="fixed bottom-6 left-6 z-50 max-w-sm bg-slate-900/95 border border-slate-800 rounded-xl p-3 text-[11px] font-mono shadow-2xl space-y-1">
-            <div className="text-slate-400 font-bold flex items-center gap-1.5 mb-1">
-              <Activity className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Live Connection Status</span>
-            </div>
-            {connectionLogs.map((log, idx) => (
-              <div key={idx} className="text-slate-300 truncate">
-                {log}
-              </div>
-            ))}
-          </div>
-        </div>
+        <CallingScreen
+          mode="dialing"
+          lineId="1-on-1 Private Line"
+          partnerName={partnerName}
+          onCancelCall={handleEndCall}
+          onDeclineCall={handleEndCall}
+        />
       )}
 
-      {/* Incoming Call Overlay */}
+      {/* Incoming Call Screen */}
       {callState === 'incoming' && (
         <CallingScreen
           mode="incoming"
-          lineId={activeLineId}
-          partnerName={partnerInfo?.displayName || 'Incoming Partner'}
-          onAcceptCall={() => handleStartCall(activeLineId, myDisplayName, false)}
-          onDeclineCall={() => {
-            soundEffects.stopRinging();
-            setCallState('idle');
-          }}
-          onCancelCall={() => {
-            soundEffects.stopRinging();
-            setCallState('idle');
-          }}
+          lineId="1-on-1 Private Line"
+          partnerName={partnerName}
+          onAcceptCall={handleAcceptIncomingCall}
+          onDeclineCall={handleDeclineIncomingCall}
+          onCancelCall={handleDeclineIncomingCall}
         />
       )}
 
@@ -667,11 +647,11 @@ export default function App() {
         <div className="flex-1 relative flex overflow-hidden">
           <div className="flex-1">
             <InCallView
-              lineId={activeLineId}
+              lineId="1-on-1 Private Line"
               localStream={localStream}
               remoteStream={remoteStream}
-              partnerInfo={partnerInfo}
-              currentUserName={myDisplayName}
+              partnerInfo={{ id: partnerUser?.id || 'partner', displayName: partnerName }}
+              currentUserName={currentUser.displayName}
               isMuted={isMuted}
               isVideoOff={isVideoOff}
               isSharingScreen={isSharingScreen}
@@ -713,19 +693,17 @@ export default function App() {
               messages={messages}
               onSendMessage={handleSendChatMessage}
               onClose={() => setIsChatOpen(false)}
-              currentUserId={myPeerIdRef.current}
+              currentUserId={currentUser.id}
             />
           )}
         </div>
       )}
 
-      {/* Call Ended Summary */}
+      {/* Post-Call Summary Screen */}
       {callState === 'ended' && lastCallLog && (
         <CallEndedSummary
           callLog={lastCallLog}
-          onRedial={() => {
-            handleStartCall(lastCallLog.lineId, myDisplayName, true);
-          }}
+          onRedial={() => handleInitiateCall('video')}
           onClose={() => {
             setCallState('idle');
             setCurrentTab('line');
@@ -742,13 +720,13 @@ export default function App() {
       {callState === 'idle' && (
         <main className="flex-1">
           {currentTab === 'line' && (
-            <LineManager
-              onStartCall={(lineId, name, isHost) => {
-                handleStartCall(lineId, name, isHost);
-              }}
+            <DirectDashboard
+              currentUser={currentUser}
+              partner={partnerUser}
+              onInitiateCall={handleInitiateCall}
               onOpenChamber={() => setCurrentTab('chamber')}
-              onShowQR={(lineId) => setQrLineId(lineId)}
-              defaultDisplayName={myDisplayName}
+              onUpdateDisplayName={handleUpdateDisplayName}
+              onLogout={() => setCurrentUser(null)}
             />
           )}
 
@@ -756,19 +734,17 @@ export default function App() {
             <DeviceSetupChamber
               onProceedToCall={(stream, name) => {
                 setLocalStream(stream);
-                setMyDisplayName(name);
+                handleUpdateDisplayName(name);
                 setCurrentTab('line');
               }}
-              defaultDisplayName={myDisplayName}
+              defaultDisplayName={currentUser.displayName}
             />
           )}
 
           {currentTab === 'history' && (
             <CallHistory
               logs={callHistory}
-              onRedial={(lineId, partnerName) => {
-                handleStartCall(lineId, myDisplayName, true);
-              }}
+              onRedial={() => handleInitiateCall('video')}
               onClearHistory={() => setCallHistory([])}
             />
           )}
@@ -780,20 +756,16 @@ export default function App() {
         <CallStatsModal stats={stats} onClose={() => setIsStatsOpen(false)} />
       )}
 
-      {qrLineId && (
-        <QRCodeModal lineId={qrLineId} onClose={() => setQrLineId(null)} />
-      )}
-
       {/* Footer */}
       <footer className="border-t border-slate-900 bg-slate-950 py-4 px-6 text-center text-xs text-slate-500 flex flex-col sm:flex-row items-center justify-between gap-4">
         <div className="flex items-center gap-2">
           <ShieldCheck className="w-4 h-4 text-emerald-400" />
-          <span>DuoCall · Dedicated Private 1-on-1 Calling Engine</span>
+          <span>DuoCall · Dedicated Private 1-on-1 Speed-Dial Engine</span>
         </div>
         <div className="flex items-center gap-4 text-slate-500">
-          <span>Max 2 Participants per Line</span>
+          <span>Logged in: {currentUser.displayName}</span>
           <span>·</span>
-          <span>WebRTC P2P + Live Audio Bridge</span>
+          <span>Encrypted WebRTC P2P + Live Audio Bridge</span>
         </div>
       </footer>
     </div>

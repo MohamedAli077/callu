@@ -11,27 +11,52 @@ const __dirname = path.dirname(__filename);
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const isProd = process.env.NODE_ENV === 'production';
 
+// Strict 2-User Account Database
+interface UserAccount {
+  id: string;
+  email: string;
+  passwordHash: string;
+  displayName: string;
+  isOnline: boolean;
+  status: 'available' | 'calling' | 'in-call' | 'offline';
+  lastSeen: number;
+}
+
+const USERS: Map<string, UserAccount> = new Map([
+  [
+    'user1',
+    {
+      id: 'user1',
+      email: 'user1@duocall.com',
+      passwordHash: 'password123',
+      displayName: 'Person 1 (Mohamed)',
+      isOnline: false,
+      status: 'offline',
+      lastSeen: Date.now(),
+    },
+  ],
+  [
+    'user2',
+    {
+      id: 'user2',
+      email: 'user2@duocall.com',
+      passwordHash: 'password123',
+      displayName: 'Person 2 (Partner)',
+      isOnline: false,
+      status: 'offline',
+      lastSeen: Date.now(),
+    },
+  ],
+]);
+
 interface PeerSocket extends WebSocket {
   id: string;
-  roomId?: string;
-  displayName?: string;
+  userId?: string;
   isAlive?: boolean;
 }
 
-interface RoomPeer {
-  id: string;
-  displayName: string;
-  lastActive: number;
-}
-
-interface Room {
-  id: string;
-  peers: Map<string, RoomPeer>;
-  wsPeers: Map<string, PeerSocket>;
-  createdAt: number;
-}
-
-const rooms = new Map<string, Room>();
+// Track active WebSocket connections per userId
+const activeUserSockets = new Map<string, PeerSocket>();
 const signalQueues = new Map<string, any[]>();
 
 const app = express();
@@ -40,68 +65,71 @@ app.use(express.json({ limit: '10mb' }));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-// Cleanup inactive rooms every 30 seconds
-setInterval(() => {
-  const now = Date.now();
-  rooms.forEach((room, roomId) => {
-    room.peers.forEach((peer, peerId) => {
-      const ws = room.wsPeers.get(peerId);
-      if (now - peer.lastActive > 45000 && (!ws || ws.readyState !== WebSocket.OPEN)) {
-        room.peers.delete(peerId);
-        room.wsPeers.delete(peerId);
-        signalQueues.delete(peerId);
-      }
-    });
-
-    if (room.peers.size === 0) {
-      rooms.delete(roomId);
-    }
-  });
-}, 30000);
-
-function deliverSignal(targetPeerId: string, signal: any) {
+function sendSignalToUser(targetUserId: string, payload: any): boolean {
   let delivered = false;
+  const ws = activeUserSockets.get(targetUserId);
 
-  rooms.forEach((room) => {
-    const ws = room.wsPeers.get(targetPeerId);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(signal));
-      delivered = true;
-    }
-  });
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+    delivered = true;
+  }
 
-  let queue = signalQueues.get(targetPeerId);
+  // Queue for HTTP polling safety net
+  let queue = signalQueues.get(targetUserId);
   if (!queue) {
     queue = [];
-    signalQueues.set(targetPeerId, queue);
+    signalQueues.set(targetUserId, queue);
   }
-  queue.push(signal);
+  queue.push(payload);
   if (queue.length > 100) queue.shift();
 
   return delivered;
 }
 
-function broadcastToRoom(roomId: string, senderId: string, signal: any) {
-  const room = rooms.get(roomId);
-  if (!room) return;
+function broadcastPresence() {
+  const userList = Array.from(USERS.values()).map((u) => ({
+    id: u.id,
+    email: u.email,
+    displayName: u.displayName,
+    isOnline: u.isOnline,
+    status: u.status,
+    lastSeen: u.lastSeen,
+  }));
 
-  room.peers.forEach((_, peerId) => {
-    if (peerId !== senderId) {
-      deliverSignal(peerId, signal);
+  const payload = { type: 'presence-update', users: userList };
+
+  activeUserSockets.forEach((ws) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(payload));
     }
   });
 }
 
-// Heartbeat ping
+// Presence Heartbeat check
 setInterval(() => {
+  const now = Date.now();
+  USERS.forEach((u) => {
+    const ws = activeUserSockets.get(u.id);
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      if (now - u.lastSeen > 30000 && u.isOnline) {
+        u.isOnline = false;
+        u.status = 'offline';
+        activeUserSockets.delete(u.id);
+      }
+    }
+  });
+
   wss.clients.forEach((ws) => {
     const peer = ws as PeerSocket;
     if (peer.isAlive === false) return peer.terminate();
     peer.isAlive = false;
     peer.ping();
   });
-}, 25000);
 
+  broadcastPresence();
+}, 15000);
+
+// WebSocket Connections
 wss.on('connection', (ws: WebSocket) => {
   const peer = ws as PeerSocket;
   peer.id = Math.random().toString(36).substring(2, 10);
@@ -116,81 +144,101 @@ wss.on('connection', (ws: WebSocket) => {
       const msg = JSON.parse(data.toString());
 
       switch (msg.type) {
-        case 'join-room': {
-          const { roomId, displayName } = msg;
-          if (!roomId) return;
+        case 'auth-connect': {
+          const { userId } = msg;
+          const user = USERS.get(userId);
+          if (user) {
+            peer.userId = userId;
+            user.isOnline = true;
+            user.status = 'available';
+            user.lastSeen = Date.now();
+            activeUserSockets.set(userId, peer);
 
-          peer.displayName = displayName || 'Peer';
-
-          let room = rooms.get(roomId);
-          if (!room) {
-            room = {
-              id: roomId,
-              peers: new Map(),
-              wsPeers: new Map(),
-              createdAt: Date.now(),
-            };
-            rooms.set(roomId, room);
-          }
-
-          if (room.peers.size >= 2 && !room.peers.has(peer.id)) {
             peer.send(
               JSON.stringify({
-                type: 'room-full',
-                roomId,
-                message: 'This 1-on-1 direct line is full (maximum 2 participants allowed).',
+                type: 'auth-success',
+                user: { id: user.id, email: user.email, displayName: user.displayName },
               })
             );
-            return;
-          }
 
-          peer.roomId = roomId;
-          room.peers.set(peer.id, {
-            id: peer.id,
-            displayName: peer.displayName || 'Peer',
-            lastActive: Date.now(),
-          });
-          room.wsPeers.set(peer.id, peer);
-
-          const existingPeers = Array.from(room.peers.values()).filter((p) => p.id !== peer.id);
-
-          peer.send(
-            JSON.stringify({
-              type: 'room-joined',
-              roomId,
-              peerId: peer.id,
-              peersCount: room.peers.size,
-              otherPeer: existingPeers[0] || null,
-            })
-          );
-
-          if (existingPeers.length > 0) {
-            broadcastToRoom(roomId, peer.id, {
-              type: 'peer-joined',
-              peerId: peer.id,
-              displayName: peer.displayName || 'Peer',
-              peersCount: room.peers.size,
-            });
+            broadcastPresence();
           }
           break;
         }
 
+        case 'direct-call-init': {
+          const { callerId, targetUserId } = msg;
+          const caller = USERS.get(callerId);
+          const target = USERS.get(targetUserId);
+
+          if (!caller || !target) return;
+
+          caller.status = 'calling';
+          broadcastPresence();
+
+          sendSignalToUser(targetUserId, {
+            type: 'incoming-call',
+            caller: { id: caller.id, displayName: caller.displayName, email: caller.email },
+          });
+          break;
+        }
+
+        case 'direct-call-accept': {
+          const { callerId, responderId } = msg;
+          const caller = USERS.get(callerId);
+          const responder = USERS.get(responderId);
+
+          if (caller) caller.status = 'in-call';
+          if (responder) responder.status = 'in-call';
+          broadcastPresence();
+
+          sendSignalToUser(callerId, {
+            type: 'call-accepted',
+            responderId,
+          });
+          break;
+        }
+
+        case 'direct-call-decline': {
+          const { callerId, responderId } = msg;
+          const caller = USERS.get(callerId);
+          const responder = USERS.get(responderId);
+
+          if (caller) caller.status = 'available';
+          if (responder) responder.status = 'available';
+          broadcastPresence();
+
+          sendSignalToUser(callerId, {
+            type: 'call-declined',
+            responderId,
+          });
+          break;
+        }
+
+        case 'direct-call-end': {
+          const { userId, partnerId } = msg;
+          const user = USERS.get(userId);
+          const partner = USERS.get(partnerId);
+
+          if (user) user.status = 'available';
+          if (partner) partner.status = 'available';
+          broadcastPresence();
+
+          if (partnerId) {
+            sendSignalToUser(partnerId, { type: 'call-ended', endedBy: userId });
+          }
+          break;
+        }
+
+        // WebRTC Signals
         case 'offer':
         case 'answer':
         case 'ice-candidate':
-        case 'call-ring':
-        case 'call-accept':
-        case 'call-decline':
-        case 'call-hangup':
         case 'media-state':
         case 'chat-message':
         case 'media-chunk': {
-          if (peer.roomId) {
-            broadcastToRoom(peer.roomId, peer.id, {
-              ...msg,
-              senderId: peer.id,
-              senderName: peer.displayName,
-            });
+          if (msg.targetUserId) {
+            sendSignalToUser(msg.targetUserId, { ...msg, senderId: peer.userId });
           }
           break;
         }
@@ -199,100 +247,94 @@ wss.on('connection', (ws: WebSocket) => {
           break;
       }
     } catch (err) {
-      console.error('WS Error handling message:', err);
+      console.error('WS Error:', err);
     }
   });
 
   peer.on('close', () => {
-    if (peer.roomId) {
-      const room = rooms.get(peer.roomId);
-      if (room) {
-        room.wsPeers.delete(peer.id);
-        broadcastToRoom(peer.roomId, peer.id, {
-          type: 'peer-left',
-          peerId: peer.id,
-          displayName: peer.displayName || 'Partner',
-          peersCount: room.peers.size - 1,
-        });
+    if (peer.userId) {
+      const u = USERS.get(peer.userId);
+      if (u) {
+        u.isOnline = false;
+        u.status = 'offline';
+        u.lastSeen = Date.now();
+        activeUserSockets.delete(peer.userId);
+        broadcastPresence();
       }
     }
   });
 });
 
-// REST Fallback APIs
-app.post('/api/signaling/join', (req, res) => {
-  const { roomId, displayName, peerId: existingPeerId } = req.body;
-  if (!roomId) return res.status(400).json({ error: 'Missing roomId' });
-
-  let room = rooms.get(roomId);
-  if (!room) {
-    room = {
-      id: roomId,
-      peers: new Map(),
-      wsPeers: new Map(),
-      createdAt: Date.now(),
-    };
-    rooms.set(roomId, room);
+// REST Authentication API
+app.post('/api/auth/login', (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password required' });
   }
 
-  const peerId = existingPeerId || Math.random().toString(36).substring(2, 10);
+  const user = Array.from(USERS.values()).find(
+    (u) => u.email.toLowerCase() === email.toLowerCase().trim() && u.passwordHash === password
+  );
 
-  if (room.peers.size >= 2 && !room.peers.has(peerId)) {
-    return res.status(403).json({
-      type: 'room-full',
-      message: 'This 1-on-1 direct call line is full (2 persons max).',
-    });
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid user email or password.' });
   }
 
-  room.peers.set(peerId, {
-    id: peerId,
-    displayName: displayName || 'Peer',
-    lastActive: Date.now(),
-  });
-
-  const existingPeers = Array.from(room.peers.values()).filter((p) => p.id !== peerId);
-
-  if (existingPeers.length > 0) {
-    broadcastToRoom(roomId, peerId, {
-      type: 'peer-joined',
-      peerId,
-      displayName: displayName || 'Peer',
-      peersCount: room.peers.size,
-    });
-  }
+  user.isOnline = true;
+  user.status = 'available';
+  user.lastSeen = Date.now();
 
   res.json({
-    type: 'room-joined',
-    roomId,
-    peerId,
-    peersCount: room.peers.size,
-    otherPeer: existingPeers[0] || null,
+    user: { id: user.id, email: user.email, displayName: user.displayName },
+    partner: Array.from(USERS.values())
+      .filter((u) => u.id !== user.id)
+      .map((u) => ({ id: u.id, email: u.email, displayName: u.displayName, isOnline: u.isOnline, status: u.status }))[0],
   });
 });
 
-app.post('/api/signaling/send', (req, res) => {
-  const { roomId, senderId, signal } = req.body;
-  if (!roomId || !signal) return res.status(400).json({ error: 'Invalid payload' });
+app.post('/api/auth/update-profile', (req, res) => {
+  const { userId, displayName } = req.body;
+  const user = USERS.get(userId);
+  if (user && displayName) {
+    user.displayName = displayName.trim();
+    broadcastPresence();
+    return res.json({ success: true, displayName: user.displayName });
+  }
+  res.status(400).json({ error: 'Invalid request' });
+});
 
-  broadcastToRoom(roomId, senderId, signal);
+app.get('/api/users/presence', (req, res) => {
+  const userList = Array.from(USERS.values()).map((u) => ({
+    id: u.id,
+    email: u.email,
+    displayName: u.displayName,
+    isOnline: u.isOnline,
+    status: u.status,
+    lastSeen: u.lastSeen,
+  }));
+  res.json({ users: userList });
+});
+
+app.post('/api/signaling/send', (req, res) => {
+  const { targetUserId, signal } = req.body;
+  if (!targetUserId || !signal) return res.status(400).json({ error: 'Missing parameters' });
+  sendSignalToUser(targetUserId, signal);
   res.json({ success: true });
 });
 
 app.get('/api/signaling/poll', (req, res) => {
-  const { roomId, peerId } = req.query as { roomId: string; peerId: string };
-  if (!peerId) return res.status(400).json({ error: 'Missing peerId' });
+  const { userId } = req.query as { userId: string };
+  if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
-  if (roomId) {
-    const room = rooms.get(roomId);
-    if (room && room.peers.has(peerId)) {
-      const p = room.peers.get(peerId)!;
-      p.lastActive = Date.now();
-    }
+  const u = USERS.get(userId);
+  if (u) {
+    u.isOnline = true;
+    u.lastSeen = Date.now();
   }
 
-  const queue = signalQueues.get(peerId) || [];
+  const queue = signalQueues.get(userId) || [];
   const signals = [...queue];
-  signalQueues.set(peerId, []);
+  signalQueues.set(userId, []);
 
   res.json({ signals });
 });
@@ -313,7 +355,7 @@ app.get('/api/ice-servers', (req, res) => {
 app.get('/api/status', (req, res) => {
   res.json({
     status: 'online',
-    activeRooms: rooms.size,
+    usersOnline: Array.from(USERS.values()).filter((u) => u.isOnline).length,
     timestamp: new Date().toISOString(),
   });
 });
